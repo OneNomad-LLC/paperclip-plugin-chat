@@ -1,0 +1,53 @@
+{
+  "name": "@onenomad/paperclip-plugin-chat",
+  "version": "0.1.0",
+  "description": "Chat with your CEO or any agent in Paperclip without opening a task. Conversations keep context, replies stream in, and the agent can act on what you ask.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "OneNomad LLC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OneNomad-LLC/paperclip-plugin-chat.git"
+  },
+  "homepage": "https://github.com/OneNomad-LLC/paperclip-plugin-chat#readme",
+  "keywords": [
+    "paperclip",
+    "paperclip-plugin",
+    "chat",
+    "agents"
+  ],
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js",
+    "ui": "./dist/ui/"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm run typecheck"
+  },
+  "dependencies": {
+    "@paperclipai/plugin-sdk": "2026.916.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "esbuild": "^0.25.0",
+    "react": "^19.0.0",
+    "typescript": "^5.9.0"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  }
+}

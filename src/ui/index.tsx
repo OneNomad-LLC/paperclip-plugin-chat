@@ -8,7 +8,7 @@ import { CSS } from "./styles";
 interface AgentSummary { id: string; name: string; role: string; title: string | null; status: string; reportsTo: string | null }
 interface ConversationSummary { id: string; title: string; agentId: string; agentName: string; createdAt: string; updatedAt: string; lastMessageAt: string | null; lastMessagePreview: string }
 interface MessageDTO { id: string; role: "user" | "assistant"; text: string; createdAt: string; runId?: string; error?: string }
-interface ConversationDTO { id: string; agentId: string; agentName: string; title: string; sessionId: string | null; createdAt: string; updatedAt: string; messages: MessageDTO[]; pending?: { runId: string; text: string; tools: string[]; startedAt: string } | null }
+interface ConversationDTO { id: string; agentId: string; agentName: string; title: string; sessionId: string | null; createdAt: string; updatedAt: string; messages: MessageDTO[]; pending?: { runId: string; text: string; tools: string[]; startedAt: string } | null; queue?: { id: string; text: string; createdAt: string }[] }
 
 type ChatStreamEvent =
   | { type: "delta"; runId: string; text: string }
@@ -333,7 +333,7 @@ function ConversationRow({
 
 // ---------- following an agent run ----------
 
-interface RunView { text: string; tools: string[]; toolCount: number; status: string; summary: string | null }
+interface RunView { runId: string; text: string; tools: string[]; toolCount: number; status: string; summary: string | null }
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "timed_out", "error"]);
 
 function parseLog(content: string, carry: { rest: string; text: string; open: Map<string, number>; count: number }) {
@@ -360,7 +360,8 @@ function parseLog(content: string, carry: { rest: string; text: string; open: Ma
 function useRun(runId: string | null) {
   const [view, setView] = useState<RunView | null>(null);
   useEffect(() => {
-    if (!runId) { setView(null); return; }
+    setView(null);
+    if (!runId) return;
     let live = true;
     let offset = 0;
     const carry = { rest: "", text: "", open: new Map<string, number>(), count: 0 };
@@ -372,7 +373,7 @@ function useRun(runId: string | null) {
         offset = typeof log.nextOffset === "number" ? log.nextOffset : offset + bytes;
         const run = await fetch(`/api/heartbeat-runs/${runId}`, { credentials: "include" }).then((r) => r.json());
         const summary = typeof run?.resultJson?.summary === "string" ? run.resultJson.summary : null;
-        if (live) setView({ text: carry.text, tools: [...carry.open.keys()], toolCount: carry.count, status: String(run?.status ?? "running"), summary });
+        if (live) setView({ runId, text: carry.text, tools: [...carry.open.keys()], toolCount: carry.count, status: String(run?.status ?? "running"), summary });
         if (live && !TERMINAL.has(String(run?.status))) timer = setTimeout(tick, 1500);
       } catch {
         if (live) timer = setTimeout(tick, 3000);
@@ -423,6 +424,10 @@ function ChatThread({
   const pending = convo?.pending ?? null;
   const run = useRun(pending?.runId || null);
   const sending = localSending || Boolean(pending);
+  const queue = convo?.queue ?? [];
+  const editQueued = usePluginAction("edit-queued");
+  const [editing, setEditing] = useState<string | null>(null);
+  const editingIndex = editing ? queue.findIndex((q) => q.id === editing) : -1;
   const messages = [...(convo?.messages ?? []), ...(optimistic && !convo?.messages.some((m) => m.role === "user" && m.text === optimistic.text && m.createdAt >= optimistic.createdAt.slice(0, 16)) ? [optimistic] : [])];
 
   // Waiting for the send to register, keep refreshing until the conversation shows the run.
@@ -435,7 +440,7 @@ function ChatThread({
 
   // When the run ends, save the reply (the worker ignores duplicates) and show it.
   useEffect(() => {
-    if (!pending?.runId || !run || !TERMINAL.has(run.status)) return;
+    if (!pending?.runId || !run || run.runId !== pending.runId || !TERMINAL.has(run.status)) return;
     const text = run.text.trim() || run.summary || "";
     const error = run.status === "succeeded" ? undefined : `The run ${run.status.replace("_", " ")}.`;
     completeReply({ companyId, conversationId, runId: pending.runId, text, error }).finally(() => {
@@ -445,7 +450,7 @@ function ChatThread({
       onSent();
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [run?.status, pending?.runId]);
+  }, [run?.status, run?.runId, pending?.runId]);
 
   useEffect(() => {
     if (convo && !convo.pending && localSending && convo.messages.at(-1)?.role === "assistant") { setLocalSending(false); setOptimistic(null); }
@@ -464,11 +469,22 @@ function ChatThread({
     el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
   }
 
+  function resetInput(text = "") {
+    setInput(text);
+    requestAnimationFrame(autoGrow);
+  }
+
   async function send() {
     const text = input.trim();
-    if (!text || sending) return;
-    setInput("");
-    requestAnimationFrame(autoGrow);
+    if (editing) return saveEdit();
+    if (!text) return;
+    resetInput();
+    if (sending) {
+      // The agent is still replying: the worker queues this and sends it when the reply ends.
+      await sendMessage({ companyId, conversationId, prompt: text }).catch(() => resetInput(text));
+      convoQuery.refresh();
+      return;
+    }
     setLocalSending(true);
     setOptimistic({ id: `local-${Date.now()}`, role: "user", text, createdAt: new Date().toISOString() });
     try {
@@ -479,10 +495,58 @@ function ChatThread({
     convoQuery.refresh();
   }
 
+  function startEdit(id: string) {
+    const q = queue.find((x) => x.id === id);
+    if (!q) return;
+    setEditing(id);
+    resetInput(q.text);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }
+
+  function cancelEdit() {
+    setEditing(null);
+    resetInput();
+  }
+
+  // Saving empty text deletes the queued message.
+  async function saveEdit() {
+    const id = editing;
+    if (!id) return;
+    setEditing(null);
+    const text = input.trim();
+    resetInput();
+    await editQueued({ companyId, conversationId, queuedId: id, text });
+    convoQuery.refresh();
+  }
+
+  async function removeQueued(id: string) {
+    if (editing === id) cancelEdit();
+    await editQueued({ companyId, conversationId, queuedId: id, text: "" });
+    convoQuery.refresh();
+  }
+
+  // The queued message went out while it was being edited.
+  useEffect(() => {
+    if (editing && !queue.some((q) => q.id === editing)) cancelEdit();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queue.length, editing]);
+
   function onKeyDown(e: RKeyboardEvent<HTMLTextAreaElement>) {
+    const el = e.currentTarget;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       send();
+    } else if (e.key === "Escape" && editing) {
+      e.preventDefault();
+      cancelEdit();
+    } else if (e.key === "ArrowUp" && queue.length && el.selectionStart === 0 && el.selectionEnd === 0 && (!input || editing)) {
+      e.preventDefault();
+      const target = editing ? queue[Math.max(0, editingIndex - 1)] : queue[queue.length - 1];
+      if (target) startEdit(target.id);
+    } else if (e.key === "ArrowDown" && editing && el.selectionStart === el.value.length) {
+      e.preventDefault();
+      const next = queue[editingIndex + 1];
+      next ? startEdit(next.id) : cancelEdit();
     }
   }
 
@@ -525,25 +589,38 @@ function ChatThread({
               </div>
             </div>
           )}
+          {queue.map((q) => (
+            <div key={q.id} className={`pcc-msg user queued${editing === q.id ? " editing" : ""}`}>
+              <button className="pcc-bubble" onClick={() => startEdit(q.id)} title="Edit queued message">{q.text}</button>
+              <span className="pcc-queued-meta">
+                {editing === q.id ? "Editing" : "Queued"} · sends when {agentName} finishes
+                <button className="pcc-icon-btn" onClick={() => removeQueued(q.id)} aria-label="Delete queued message" title="Delete"><Icon d={I.trash} sm /></button>
+              </span>
+            </div>
+          ))}
         </div>
       </div>
       <div className="pcc-dock">
+        {editing && (
+          <div className="pcc-editing">
+            Editing a queued message · <kbd>Enter</kbd> to save · empty to delete · <kbd>Esc</kbd> to cancel
+          </div>
+        )}
         <div className="pcc-composer">
           <textarea
             ref={textareaRef}
             value={input}
             onChange={(e) => { setInput(e.target.value); autoGrow(); }}
             onKeyDown={onKeyDown}
-            placeholder={`Message ${agentName}…`}
-            disabled={sending}
+            placeholder={sending ? `Queue a follow-up for ${agentName}…` : `Message ${agentName}…`}
             rows={1}
           />
-          <button className="pcc-send" onClick={send} disabled={!input.trim() || sending} aria-label="Send" title="Send (Enter)">
+          <button className="pcc-send" onClick={send} disabled={!input.trim() && !editing} aria-label={editing ? "Save" : sending ? "Queue" : "Send"} title={editing ? "Save (Enter)" : sending ? "Queue (Enter)" : "Send (Enter)"}>
             <Icon d={I.up} />
           </button>
         </div>
         <div className="pcc-hint">
-          <span><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</span>
+          <span><kbd>Enter</kbd> to {sending ? "queue" : "send"} · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line{queue.length ? <> · <kbd>↑</kbd> to edit queued</> : null}</span>
           <span>Each message is a real agent run</span>
         </div>
       </div>

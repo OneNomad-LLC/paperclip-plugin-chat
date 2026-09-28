@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
 import { definePlugin, runWorker, type PluginContext } from "@paperclipai/plugin-sdk";
 import type { AgentSessionEvent } from "@paperclipai/plugin-sdk";
 import { randomUUID } from "node:crypto";
@@ -23,6 +26,8 @@ interface Conversation {
   messages: Message[];
   // The reply in progress. The page polls the conversation while this is set.
   pending?: { runId: string; text: string; tools: string[]; startedAt: string } | null;
+  // Follow-ups sent while the agent was replying. They go out together when the reply ends.
+  queue?: { id: string; text: string; createdAt: string }[];
 }
 
 interface ConversationSummary {
@@ -51,35 +56,67 @@ function indexKey(companyId: string) {
 function conversationKey(companyId: string, id: string) {
   return { scopeKind: "company" as const, scopeId: companyId, namespace: NAMESPACE, stateKey: `conversation:${id}` };
 }
-// Paperclip doesn't resume chat sessions between runs, so every message carries the whole conversation.
-const HISTORY_LIMIT = 120_000;
+// Paperclip doesn't resume chat sessions between runs and cuts each message to an agent at 12,000
+// characters, keeping the start. So the new message goes first, then as many recent turns as fit,
+// and the full transcript is written to a file the agent can read.
+const PROMPT_BUDGET = 11_000;
+const PER_MESSAGE_CAP = 1_800;
 
-function promptWithHistory(convo: Conversation, newMessage: string): string {
-  const earlier = convo.messages.slice(0, -1).filter((m) => m.text.trim());
-  const lines = earlier.map((m) => {
-    const who = m.role === "user" ? "Board" : `You (${convo.agentName})`;
-    return `[${who}, ${m.createdAt.slice(0, 16).replace("T", " ")} UTC]\n${m.text.trim()}`;
-  });
-  let transcript = lines.join("\n\n");
-  let trimmed = false;
-  while (transcript.length > HISTORY_LIMIT && lines.length > 1) {
-    lines.shift();
-    trimmed = true;
-    transcript = lines.join("\n\n");
+function transcriptPath(companyId: string, conversationId: string) {
+  return join(homedir(), ".paperclip", "plugin-data", "onenomad-chat", companyId, `${conversationId}.md`);
+}
+
+// Long text keeps its start and its end: decisions and questions tend to sit at either end.
+function shorten(text: string, cap: number) {
+  if (text.length <= cap) return text;
+  const head = Math.floor(cap * 0.55);
+  const tail = cap - head;
+  return `${text.slice(0, head)}\n[… ${text.length - cap} characters left out here, the full text is in the transcript file …]\n${text.slice(-tail)}`;
+}
+
+function formatTurn(convo: Conversation, m: Message, cap = Infinity) {
+  const who = m.role === "user" ? "Board" : `You (${convo.agentName})`;
+  const body = shorten(m.text.trim(), cap);
+  return `[${who}, ${m.createdAt.slice(0, 16).replace("T", " ")} UTC]\n${body}`;
+}
+
+async function writeTranscript(companyId: string, convo: Conversation) {
+  const path = transcriptPath(companyId, convo.id);
+  await mkdir(dirname(path), { recursive: true });
+  const turns = convo.messages.filter((m) => m.text.trim()).map((m) => formatTurn(convo, m));
+  await writeFile(path, `# Chat: ${convo.title}\n\nBetween the board and ${convo.agentName}, oldest first.\n\n${turns.join("\n\n")}\n`);
+  return path;
+}
+
+function promptWithHistory(convo: Conversation, newCount: number, transcriptFile: string | null): string {
+  const fresh = convo.messages.slice(-newCount).map((m) => m.text.trim());
+  const heading = fresh.length > 1 ? "New messages from the board (sent one after another while you were replying; answer all of them):" : "New message from the board:";
+  let newBlock = fresh.length > 1 ? fresh.map((t, i) => `${i + 1}. ${t}`).join("\n\n") : fresh[0] ?? "";
+  newBlock = shorten(newBlock, 7_000);
+  const intro = "This comes from Paperclip's Chat page. The board (the person who runs this company) is chatting with you directly, outside any task. Everything below is from that chat, written by the board and by you in earlier turns.";
+  const fileNote = transcriptFile
+    ? `The complete chat, word for word, is saved at ${transcriptFile} (written by Paperclip's Chat plugin). Read that file before you answer whenever your reply depends on something not shown here, such as older messages or ones marked as shortened.`
+    : "";
+
+  const earlier = convo.messages.slice(0, -newCount).filter((m) => m.text.trim());
+  let used = intro.length + heading.length + newBlock.length + fileNote.length + 400;
+  const recent: string[] = [];
+  for (let k = earlier.length - 1; k >= 0; k--) {
+    const turn = formatTurn(convo, earlier[k], PER_MESSAGE_CAP);
+    if (used + turn.length + 2 > PROMPT_BUDGET) break;
+    recent.unshift(turn);
+    used += turn.length + 2;
   }
-  const intro = "This is a direct chat with the board (the person who runs this company) in Paperclip's Chat page. It isn't attached to a task.";
-  if (!lines.length) return `${intro}\n\nMessage from the board:\n${newMessage}`;
+  const omitted = earlier.length - recent.length;
   return [
     intro,
-    `The conversation so far, oldest first${trimmed ? " (the earliest messages were left out to save space)" : ""}:`,
-    "<conversation>",
-    transcript,
-    "</conversation>",
-    "New message from the board:",
-    newMessage,
-    "",
-    "Reply to the new message, using the whole conversation above as context.",
-  ].join("\n\n");
+    heading,
+    newBlock,
+    earlier.length ? `Recent chat history, oldest first${omitted ? ` (${omitted} older messages are only in the transcript file)` : ""}:` : "",
+    recent.length ? `<conversation>\n${recent.join("\n\n")}\n</conversation>` : "",
+    fileNote,
+    "Reply to the board's new message, using the chat history as context.",
+  ].filter(Boolean).join("\n\n");
 }
 
 function titleFromPrompt(prompt: string): string {
@@ -115,21 +152,54 @@ const plugin = definePlugin({
       return (raw as Conversation | null) ?? null;
     }
     // Saves the agent's reply once per run, whichever path gets there first (session events or the page).
-    async function completeReply(companyId: string, conversationId: string, runId: string, text: string, error?: string) {
-      const convo = await loadConversation(companyId, conversationId);
-      if (!convo) return null;
-      if (runId && convo.messages.some((m) => m.role === "assistant" && m.runId === runId)) return convo;
-      const at = new Date().toISOString();
-      convo.messages.push({ id: `a-${runId || Date.now()}`, role: "assistant", text, createdAt: at, runId: runId || undefined, error });
-      convo.pending = null;
-      convo.updatedAt = at;
-      await saveConversation(companyId, convo);
+    // Every change to a conversation goes through here: one at a time per conversation, always on fresh data.
+    const locks = new Map<string, Promise<unknown>>();
+    async function mutate<T>(companyId: string, conversationId: string, change: (convo: Conversation) => T): Promise<{ convo: Conversation; result: T } | null> {
+      const key = `${companyId}:${conversationId}`;
+      const run = (locks.get(key) ?? Promise.resolve()).then(async () => {
+        const convo = await loadConversation(companyId, conversationId);
+        if (!convo) return null;
+        const result = change(convo);
+        await saveConversation(companyId, convo);
+        return { convo, result };
+      });
+      locks.set(key, run.catch(() => undefined));
+      return run;
+    }
+
+    const placeholder = () => ({ runId: "", text: "", tools: [] as string[], startedAt: new Date().toISOString() });
+
+    async function touchIndex(companyId: string, convo: Conversation, preview: string) {
       await upsertIndexEntry(companyId, {
         id: convo.id, title: convo.title, agentId: convo.agentId, agentName: convo.agentName,
-        createdAt: convo.createdAt, updatedAt: at, lastMessageAt: at,
-        lastMessagePreview: (error ?? text).trim().replace(/\s+/g, " ").slice(0, 140),
+        createdAt: convo.createdAt, updatedAt: convo.updatedAt, lastMessageAt: convo.updatedAt,
+        lastMessagePreview: preview.trim().replace(/\s+/g, " ").slice(0, 140),
       });
-      return convo;
+    }
+
+    // Saves the agent's reply once per run, whichever path gets there first, then sends anything queued.
+    async function completeReply(companyId: string, conversationId: string, runId: string, text: string, error?: string) {
+      const done = await mutate(companyId, conversationId, (convo) => {
+        if (runId && convo.messages.some((m) => m.role === "assistant" && m.runId === runId)) return { saved: false, next: 0 };
+        if (runId && convo.pending?.runId && convo.pending.runId !== runId) return { saved: false, next: 0 };
+        const at = new Date().toISOString();
+        convo.messages.push({ id: `a-${runId || Date.now()}`, role: "assistant", text, createdAt: at, runId: runId || undefined, error });
+        convo.pending = null;
+        convo.updatedAt = at;
+        const queued = convo.queue ?? [];
+        if (queued.length) {
+          for (const q of queued) convo.messages.push({ id: q.id, role: "user", text: q.text, createdAt: q.createdAt });
+          convo.queue = [];
+          convo.pending = placeholder();
+          convo.updatedAt = queued[queued.length - 1].createdAt;
+        }
+        return { saved: true, next: queued.length };
+      });
+      if (!done || !done.result.saved) return done?.convo ?? null;
+      const last = done.convo.messages[done.convo.messages.length - 1];
+      await touchIndex(companyId, done.convo, last.error ?? last.text);
+      if (done.result.next) await startTurn(companyId, done.convo, done.result.next).catch((e) => ctx.logger.warn(`chat ${conversationId}: queued follow-up failed: ${e}`));
+      return done.convo;
     }
 
     async function saveConversation(companyId: string, convo: Conversation): Promise<void> {
@@ -236,33 +306,45 @@ const plugin = definePlugin({
 
     ctx.actions.register("send-message", async (params) => {
       const { companyId, conversationId, prompt } = params as { companyId: string; conversationId: string; prompt: string };
-      const convo = await loadConversation(companyId, conversationId);
-      if (!convo) throw new Error("Conversation not found.");
-
-      const isFirstMessage = convo.messages.length === 0;
-      const now = new Date().toISOString();
-      const userMessage: Message = { id: randomUUID(), role: "user", text: prompt, createdAt: now };
-      convo.messages.push(userMessage);
-      if (isFirstMessage) convo.title = titleFromPrompt(prompt);
-      convo.updatedAt = now;
-      await saveConversation(companyId, convo);
-      const agentPrompt = promptWithHistory(convo, prompt);
-      await upsertIndexEntry(companyId, {
-        id: convo.id,
-        title: convo.title,
-        agentId: convo.agentId,
-        agentName: convo.agentName,
-        createdAt: convo.createdAt,
-        updatedAt: convo.updatedAt,
-        lastMessageAt: now,
-        lastMessagePreview: prompt.trim().replace(/\s+/g, " ").slice(0, 140),
+      const sent = await mutate(companyId, conversationId, (convo) => {
+        const now = new Date().toISOString();
+        if (convo.pending) {
+          convo.queue = [...(convo.queue ?? []), { id: randomUUID(), text: prompt, createdAt: now }];
+          return { queued: true };
+        }
+        if (convo.messages.length === 0) convo.title = titleFromPrompt(prompt);
+        convo.messages.push({ id: randomUUID(), role: "user", text: prompt, createdAt: now });
+        convo.updatedAt = now;
+        convo.pending = placeholder();
+        return { queued: false };
       });
+      if (!sent) throw new Error("Conversation not found.");
+      if (sent.result.queued) return { queued: true, conversationId };
+      await touchIndex(companyId, sent.convo, prompt);
+      return startTurn(companyId, sent.convo, 1);
+    });
 
+    ctx.actions.register("edit-queued", async (params) => {
+      const { companyId, conversationId, queuedId, text } = params as { companyId?: string; conversationId?: string; queuedId?: string; text?: string };
+      if (!companyId || !conversationId || !queuedId) return null;
+      const trimmed = (text ?? "").trim();
+      const edited = await mutate(companyId, conversationId, (convo) => {
+        convo.queue = trimmed
+          ? (convo.queue ?? []).map((q) => (q.id === queuedId ? { ...q, text: trimmed } : q))
+          : (convo.queue ?? []).filter((q) => q.id !== queuedId);
+        return convo.queue.some((q) => q.id === queuedId) ? "edited" : "removed";
+      });
+      return edited ? { ok: true, queued: edited.result } : null;
+    });
+
+    // Starts one agent run for the last `newCount` user messages, with the whole conversation as context.
+    async function startTurn(companyId: string, convo: Conversation, newCount: number) {
+      const conversationId = convo.id;
+      const transcriptFile = await writeTranscript(companyId, convo).catch((e) => { ctx.logger.warn(`transcript write failed: ${e}`); return null; });
+      const agentPrompt = promptWithHistory(convo, newCount, transcriptFile);
       const activeConvo: Conversation = convo;
       const channel = streamChannel(conversationId);
       try { ctx.streams.open(channel, companyId); } catch { /* the host may not have the stream bridge enabled */ }
-      activeConvo.pending = { runId: "", text: "", tools: [], startedAt: new Date().toISOString() };
-      await saveConversation(companyId, activeConvo);
       ctx.logger.info(`chat ${conversationId}: sending to ${activeConvo.agentName}`);
       let lastSave = 0;
       let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -273,7 +355,10 @@ const plugin = definePlugin({
         saveTimer = setTimeout(() => {
           saveTimer = null;
           lastSave = Date.now();
-          if (!finalized) void saveConversation(companyId, activeConvo).catch((e) => ctx.logger.warn(`chat save failed: ${e}`));
+          const partial = activeConvo.pending;
+          if (!finalized && partial) void mutate(companyId, conversationId, (c) => {
+            if (c.pending && (!c.pending.runId || c.pending.runId === partial.runId)) c.pending = { ...c.pending, runId: partial.runId, text: partial.text, tools: partial.tools };
+          }).catch((e) => ctx.logger.warn(`chat save failed: ${e}`));
         }, wait);
       }
 
@@ -352,18 +437,17 @@ const plugin = definePlugin({
       }
 
       async function recordRun(runId: string) {
-        const fresh = await loadConversation(companyId, conversationId);
-        if (!fresh?.pending) return;
-        fresh.pending.runId = runId;
-        activeConvo.pending = fresh.pending;
-        await saveConversation(companyId, fresh);
+        await mutate(companyId, conversationId, (c) => {
+          if (c.pending && !c.pending.runId) c.pending.runId = runId;
+        });
+        if (activeConvo.pending) activeConvo.pending.runId = runId;
       }
 
       async function ensureSession(): Promise<string> {
         if (activeConvo.sessionId) return activeConvo.sessionId;
         const session = await ctx.agents.sessions.create(activeConvo.agentId, companyId, { reason: "Chat plugin conversation" });
         activeConvo.sessionId = session.sessionId;
-        await saveConversation(companyId, activeConvo);
+        await mutate(companyId, conversationId, (c) => { c.sessionId = session.sessionId; });
         return session.sessionId;
       }
 
@@ -375,6 +459,7 @@ const plugin = definePlugin({
           return { runId: result.runId, conversationId, assistantMessageId };
         } catch {
           activeConvo.sessionId = null;
+          await mutate(companyId, conversationId, (c) => { c.sessionId = null; });
           sessionId = await ensureSession();
           const result = await ctx.agents.sessions.sendMessage(sessionId, companyId, { prompt: agentPrompt, reason: "Chat plugin message", onEvent });
           await recordRun(result.runId);
@@ -385,7 +470,7 @@ const plugin = definePlugin({
         await finalize("none", assistantText, message);
         throw err;
       }
-    });
+    }
   },
 });
 

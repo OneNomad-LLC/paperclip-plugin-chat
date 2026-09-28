@@ -63,6 +63,11 @@ export const CSS = `
 .pcc-msg.user .pcc-bubble { max-width: 80%; padding: 9px 14px; border-radius: 18px 18px 6px 18px; background: var(--pcc-blue); color: white; font-size: 14px; line-height: 21px; white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 1px 2px oklch(0% 0 0 / .08); }
 .pcc-msg.user .pcc-time { opacity: 0; transition: opacity .15s; }
 .pcc-msg.user:hover .pcc-time { opacity: 1; }
+.pcc-msg.user.queued .pcc-bubble { background: transparent !important; color: var(--foreground) !important; border: 1px dashed color-mix(in oklch, var(--pcc-blue) 55%, var(--border)) !important; box-shadow: none; cursor: pointer; text-align: left; font: inherit; font-size: 14px; line-height: 21px; }
+.pcc-msg.user.queued.editing .pcc-bubble { border-style: solid !important; border-color: var(--pcc-blue) !important; box-shadow: 0 0 0 3px color-mix(in oklch, var(--pcc-blue) 18%, transparent); }
+.pcc-queued-meta { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted-foreground); }
+.pcc-editing { pointer-events: auto; max-width: 760px; margin: 0 auto 8px; font-size: 12px; color: var(--foreground); background: color-mix(in oklch, var(--pcc-blue) 12%, var(--background)); border: 1px solid color-mix(in oklch, var(--pcc-blue) 35%, var(--border)); border-radius: 10px; padding: 6px 12px; }
+.pcc-editing kbd { font: 10px ui-monospace, monospace; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; }
 .pcc-time { padding: 0 4px; font-size: 11px; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
 .pcc-msg.assistant { display: grid; grid-template-columns: 28px 1fr; column-gap: 12px; align-items: start; }
 .pcc-content { min-width: 0; display: flex; flex-direction: column; gap: 6px; }

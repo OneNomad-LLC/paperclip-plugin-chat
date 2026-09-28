@@ -33,7 +33,15 @@ do, ask the agent before you send something that commits it to work.
 
 ## How the agent remembers the conversation
 
-Paperclip doesn't resume an agent's session between chat runs, so every message you send includes the whole conversation so far. The agent always sees the entire chat. Very long chats drop their oldest messages from what's sent (the full history stays saved), and the agent is told when that happens.
+Paperclip doesn't resume an agent's session between chat runs, and it cuts every message it hands an agent at 12,000 characters. So each time you send something, the plugin builds one message that fits:
+
+1. Your new message comes first, so it's never the part that gets cut.
+2. Then as many recent turns as fit. Long messages keep their start and their end, with a marker showing what was left out.
+3. The complete chat is written to `~/.paperclip/plugin-data/onenomad-chat/<company>/<conversation>.md`, and the agent is told to read it when the recent turns aren't enough.
+
+## Queued follow-ups
+
+You can keep typing while the agent replies. Messages sent during a reply are queued and go to the agent together, as one follow-up, when the reply finishes. Press the up arrow in an empty message box to edit the last queued message (up again for earlier ones, Esc to cancel). Clear its text and press Enter to delete it.
 
 ## Where history lives
 

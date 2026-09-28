@@ -90,7 +90,7 @@ const plugin = definePlugin({
     ctx.data.register("agents", async (params) => {
       const companyId = params?.companyId as string | undefined;
       if (!companyId) return { agents: [], defaultAgentId: null };
-      const agents = await ctx.agents.list({ companyId });
+      const agents = (await ctx.agents.list({ companyId })).filter((a) => a.status !== "terminated");
       const ceo = agents.find((a) => a.role === "ceo");
       const noReport = agents.find((a) => !a.reportsTo);
       const defaultAgentId = ceo?.id ?? noReport?.id ?? agents[0]?.id ?? null;

@@ -21,6 +21,8 @@ interface Conversation {
   createdAt: string;
   updatedAt: string;
   messages: Message[];
+  // The reply in progress. The page polls the conversation while this is set.
+  pending?: { runId: string; text: string; tools: string[]; startedAt: string } | null;
 }
 
 interface ConversationSummary {
@@ -81,6 +83,24 @@ const plugin = definePlugin({
       const raw = await ctx.state.get(conversationKey(companyId, id));
       return (raw as Conversation | null) ?? null;
     }
+    // Saves the agent's reply once per run, whichever path gets there first (session events or the page).
+    async function completeReply(companyId: string, conversationId: string, runId: string, text: string, error?: string) {
+      const convo = await loadConversation(companyId, conversationId);
+      if (!convo) return null;
+      if (runId && convo.messages.some((m) => m.role === "assistant" && m.runId === runId)) return convo;
+      const at = new Date().toISOString();
+      convo.messages.push({ id: `a-${runId || Date.now()}`, role: "assistant", text, createdAt: at, runId: runId || undefined, error });
+      convo.pending = null;
+      convo.updatedAt = at;
+      await saveConversation(companyId, convo);
+      await upsertIndexEntry(companyId, {
+        id: convo.id, title: convo.title, agentId: convo.agentId, agentName: convo.agentName,
+        createdAt: convo.createdAt, updatedAt: at, lastMessageAt: at,
+        lastMessagePreview: (error ?? text).trim().replace(/\s+/g, " ").slice(0, 140),
+      });
+      return convo;
+    }
+
     async function saveConversation(companyId: string, convo: Conversation): Promise<void> {
       await ctx.state.set(conversationKey(companyId, convo.id), convo);
     }
@@ -111,7 +131,13 @@ const plugin = definePlugin({
       const companyId = params?.companyId as string | undefined;
       const conversationId = params?.conversationId as string | undefined;
       if (!companyId || !conversationId) return null;
-      return await loadConversation(companyId, conversationId);
+      const convo = await loadConversation(companyId, conversationId);
+      if (convo?.pending && Date.now() - new Date(convo.pending.startedAt).getTime() > 35 * 60 * 1000) {
+        convo.messages.push({ id: `stale-${Date.now()}`, role: "assistant", text: convo.pending.text, createdAt: new Date().toISOString(), runId: convo.pending.runId || undefined, error: "The reply never finished. Check the agent's runs." } as Message);
+        convo.pending = null;
+        await saveConversation(companyId, convo);
+      }
+      return convo;
     });
 
     // ---------- actions (writes) ----------
@@ -164,6 +190,12 @@ const plugin = definePlugin({
       return convo;
     });
 
+    ctx.actions.register("complete-reply", async (params) => {
+      const p = params as { companyId?: string; conversationId?: string; runId?: string; text?: string; error?: string };
+      if (!p.companyId || !p.conversationId || !p.runId) return null;
+      return completeReply(p.companyId, p.conversationId, p.runId, p.text ?? "", p.error || undefined);
+    });
+
     ctx.actions.register("delete-conversation", async (params) => {
       const { companyId, conversationId } = params as { companyId: string; conversationId: string };
       await ctx.state.delete(conversationKey(companyId, conversationId));
@@ -196,7 +228,22 @@ const plugin = definePlugin({
 
       const activeConvo: Conversation = convo;
       const channel = streamChannel(conversationId);
-      ctx.streams.open(channel, companyId);
+      try { ctx.streams.open(channel, companyId); } catch { /* the host may not have the stream bridge enabled */ }
+      activeConvo.pending = { runId: "", text: "", tools: [], startedAt: new Date().toISOString() };
+      await saveConversation(companyId, activeConvo);
+      ctx.logger.info(`chat ${conversationId}: sending to ${activeConvo.agentName}`);
+      let lastSave = 0;
+      let saveTimer: ReturnType<typeof setTimeout> | null = null;
+      function savePending(runId: string) {
+        activeConvo.pending = { runId, text: assistantText, tools: Array.from(pendingTools.keys()), startedAt: activeConvo.pending?.startedAt ?? new Date().toISOString() };
+        const wait = Math.max(0, 1500 - (Date.now() - lastSave));
+        if (saveTimer) return;
+        saveTimer = setTimeout(() => {
+          saveTimer = null;
+          lastSave = Date.now();
+          if (!finalized) void saveConversation(companyId, activeConvo).catch((e) => ctx.logger.warn(`chat save failed: ${e}`));
+        }, wait);
+      }
 
       const assistantMessageId = randomUUID();
       let assistantText = "";
@@ -231,40 +278,21 @@ const plugin = definePlugin({
       }
 
       function emit(event: ChatStreamEvent) {
-        ctx.streams.emit(channel, event);
+        try { ctx.streams.emit(channel, event); } catch { /* no stream bridge: the page polls instead */ }
       }
 
       async function finalize(runId: string, text: string, errorMessage: string | undefined) {
         if (finalized) return;
         finalized = true;
-        const finishedAt = new Date().toISOString();
-        const assistantMessage: Message = {
-          id: assistantMessageId,
-          role: "assistant",
-          text,
-          createdAt: finishedAt,
-          runId,
-          error: errorMessage,
-        };
-        activeConvo.messages.push(assistantMessage);
-        activeConvo.updatedAt = finishedAt;
-        await saveConversation(companyId, activeConvo);
-        await upsertIndexEntry(companyId, {
-          id: activeConvo.id,
-          title: activeConvo.title,
-          agentId: activeConvo.agentId,
-          agentName: activeConvo.agentName,
-          createdAt: activeConvo.createdAt,
-          updatedAt: finishedAt,
-          lastMessageAt: finishedAt,
-          lastMessagePreview: (errorMessage ?? text).trim().replace(/\s+/g, " ").slice(0, 140),
-        });
+        if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+        await completeReply(companyId, activeConvo.id, runId, text, errorMessage);
+        ctx.logger.info(`chat ${activeConvo.id}: reply saved (${text.length} chars${errorMessage ? `, error: ${errorMessage}` : ""})`);
         emit(
           errorMessage
             ? { type: "error", runId, message: errorMessage, messageId: assistantMessageId }
             : { type: "done", runId, text, messageId: assistantMessageId },
         );
-        ctx.streams.close(channel);
+        try { ctx.streams.close(channel); } catch { /* no stream bridge */ }
       }
 
       function onEvent(event: AgentSessionEvent) {
@@ -275,16 +303,28 @@ const plugin = definePlugin({
             if (parsed.type === "acpx.text_delta" && parsed.channel === "output" && typeof parsed.text === "string") {
               assistantText += parsed.text;
               emit({ type: "delta", runId: event.runId, text: assistantText });
+              savePending(event.runId);
             } else if (parsed.type === "acpx.tool_call" && typeof parsed.name === "string" && typeof parsed.status === "string") {
               trackTool(parsed.name, parsed.status);
               emit({ type: "activity", runId: event.runId, tools: Array.from(pendingTools.keys()) });
+              savePending(event.runId);
             }
           }
+        } else if (event.eventType === "status") {
+          ctx.logger.info(`chat ${activeConvo.id}: ${event.message ?? "status"}`);
         } else if (event.eventType === "done") {
           void finalize(event.runId, event.message ?? assistantText, undefined);
         } else if (event.eventType === "error") {
           void finalize(event.runId, assistantText, event.message ?? "The agent run failed.");
         }
+      }
+
+      async function recordRun(runId: string) {
+        const fresh = await loadConversation(companyId, conversationId);
+        if (!fresh?.pending) return;
+        fresh.pending.runId = runId;
+        activeConvo.pending = fresh.pending;
+        await saveConversation(companyId, fresh);
       }
 
       async function ensureSession(): Promise<string> {
@@ -299,11 +339,13 @@ const plugin = definePlugin({
         let sessionId = await ensureSession();
         try {
           const result = await ctx.agents.sessions.sendMessage(sessionId, companyId, { prompt, reason: "Chat plugin message", onEvent });
+          await recordRun(result.runId);
           return { runId: result.runId, conversationId, assistantMessageId };
         } catch {
           activeConvo.sessionId = null;
           sessionId = await ensureSession();
           const result = await ctx.agents.sessions.sendMessage(sessionId, companyId, { prompt, reason: "Chat plugin message", onEvent });
+          await recordRun(result.runId);
           return { runId: result.runId, conversationId, assistantMessageId };
         }
       } catch (err) {

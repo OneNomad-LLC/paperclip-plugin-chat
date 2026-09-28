@@ -1,7 +1,7 @@
 # Chat
 
 Talk to any agent in Paperclip directly, without opening a task. Pick an agent, send a message, and the
-reply streams in. Conversations remember context, so follow-ups keep building on what the agent already
+reply appears as the agent writes it. Conversations remember context, so follow-ups keep building on what the agent already
 knows.
 
 ## Install
@@ -16,7 +16,7 @@ paperclipai plugin install @onenomad/paperclip-plugin-chat
 - Start a new conversation with any agent in the company (defaults to the CEO, or whoever is at the top
   of the org chart if there's no CEO).
 - Each conversation keeps one agent session, so the agent remembers earlier messages in that thread.
-- Replies stream in as the agent writes them, with a short "Working: Terminal, Read…" line while it's
+- Replies appear as the agent writes them, with a short "Working: Terminal, Read…" line while it's
   using tools.
 - Rename or delete conversations from the sidebar list.
 
@@ -29,9 +29,7 @@ agents, or do anything else it's normally allowed to do. There's no sandboxed "j
 The composer says this plainly under the send button. If you're not sure what a message will cost or
 do, ask the agent before you send something that commits it to work.
 
-**Stop** ends the plugin's connection to the stream, not the run itself. Once an agent run is underway,
-Paperclip can't cancel it from here. The agent may keep working and finish its reply after you've
-stopped watching; you'll see the finished message next time you open that conversation.
+**How replies show up.** The page follows the agent's run through Paperclip's own run API with your session, so text and tool activity appear as the agent works. The reply is saved to the conversation when the run ends. Leaving the page doesn't stop the run: open the conversation again and the finished reply is there.
 
 ## Where history lives
 

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent as RKeyboardEvent } from "react";
-import { useHostContext, useHostLocation, useHostNavigation, usePluginAction, usePluginData, usePluginStream, MarkdownBlock } from "@paperclipai/plugin-sdk/ui";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as RKeyboardEvent } from "react";
+import { useHostContext, useHostLocation, useHostNavigation, usePluginAction, usePluginData, MarkdownBlock } from "@paperclipai/plugin-sdk/ui";
 import type { PluginPageProps, PluginSidebarProps } from "@paperclipai/plugin-sdk/ui";
 import { CSS } from "./styles";
 
@@ -8,7 +8,7 @@ import { CSS } from "./styles";
 interface AgentSummary { id: string; name: string; role: string; title: string | null; status: string; reportsTo: string | null }
 interface ConversationSummary { id: string; title: string; agentId: string; agentName: string; createdAt: string; updatedAt: string; lastMessageAt: string | null; lastMessagePreview: string }
 interface MessageDTO { id: string; role: "user" | "assistant"; text: string; createdAt: string; runId?: string; error?: string }
-interface ConversationDTO { id: string; agentId: string; agentName: string; title: string; sessionId: string | null; createdAt: string; updatedAt: string; messages: MessageDTO[] }
+interface ConversationDTO { id: string; agentId: string; agentName: string; title: string; sessionId: string | null; createdAt: string; updatedAt: string; messages: MessageDTO[]; pending?: { runId: string; text: string; tools: string[]; startedAt: string } | null }
 
 type ChatStreamEvent =
   | { type: "delta"; runId: string; text: string }
@@ -46,6 +46,9 @@ const I = {
   edit: '<path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
   trash: '<path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6h16z"/>',
   check: '<path d="M20 6 9 17l-5-5"/>',
+  up: '<path d="M12 19V5M5 12l7-7 7 7"/>',
+  bot: '<rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4M8 14h.01M16 14h.01"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
 };
 
 function useActiveConversation() {
@@ -99,6 +102,14 @@ export function ChatPage({ context }: PluginPageProps) {
   const deleteConversation = usePluginAction("delete-conversation");
 
   const [pickerOpen, setPickerOpen] = useState(false);
+  const pageRef = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState(600);
+  useLayoutEffect(() => {
+    const measure = () => { const top = pageRef.current?.getBoundingClientRect().top ?? 0; setHeight(Math.max(420, window.innerHeight - top - 8)); };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
 
   const agents = agentsQuery.data?.agents ?? [];
   const conversations = conversationsQuery.data ?? [];
@@ -134,7 +145,7 @@ export function ChatPage({ context }: PluginPageProps) {
   }
 
   return (
-    <div className="pcc pcc-page">
+    <div ref={pageRef} className="pcc pcc-page" style={{ height }}>
       <aside className="pcc-side">
         <header>
           <h1>Chat</h1>
@@ -211,7 +222,7 @@ function AgentPicker({
         {agents.map((a) => (
           <option key={a.id} value={a.id}>
             {a.name}
-            {a.title ? ` — ${a.title}` : ""}
+            {a.title && a.title !== a.name ? ` · ${a.title}` : ""}
           </option>
         ))}
       </select>
@@ -296,7 +307,68 @@ function ConversationRow({
   );
 }
 
+// ---------- following an agent run ----------
+
+interface RunView { text: string; tools: string[]; toolCount: number; status: string; summary: string | null }
+const TERMINAL = new Set(["succeeded", "failed", "cancelled", "timed_out", "error"]);
+
+function parseLog(content: string, carry: { rest: string; text: string; open: Map<string, number>; count: number }) {
+  const lines = (carry.rest + content).split("\n");
+  carry.rest = lines.pop() ?? "";
+  for (const line of lines) {
+    let entry: { chunk?: string };
+    try { entry = JSON.parse(line); } catch { continue; }
+    for (const part of (entry.chunk ?? "").split("\n")) {
+      if (!part.startsWith("{")) continue;
+      let e: { type?: string; text?: string; channel?: string; name?: string; status?: string };
+      try { e = JSON.parse(part); } catch { continue; }
+      if (e.type === "acpx.text_delta" && e.channel === "output" && e.text) carry.text += e.text;
+      if (e.type === "acpx.tool_call" && e.name && e.status === "pending") { carry.open.set(e.name, (carry.open.get(e.name) ?? 0) + 1); carry.count++; }
+      if (e.type === "acpx.tool_call" && e.name && e.status === "completed") {
+        const n = (carry.open.get(e.name) ?? 1) - 1;
+        n > 0 ? carry.open.set(e.name, n) : carry.open.delete(e.name);
+      }
+    }
+  }
+}
+
+// Follows a run through Paperclip's own API with the viewer's session: status plus its log, read incrementally.
+function useRun(runId: string | null) {
+  const [view, setView] = useState<RunView | null>(null);
+  useEffect(() => {
+    if (!runId) { setView(null); return; }
+    let live = true;
+    let offset = 0;
+    const carry = { rest: "", text: "", open: new Map<string, number>(), count: 0 };
+    const tick = async () => {
+      try {
+        const log = await fetch(`/api/heartbeat-runs/${runId}/log?offset=${offset}&limitBytes=262144`, { credentials: "include" }).then((r) => r.json());
+        if (typeof log.content === "string") parseLog(log.content, carry);
+        const bytes = typeof log.content === "string" ? new TextEncoder().encode(log.content).length : 0;
+        offset = typeof log.nextOffset === "number" ? log.nextOffset : offset + bytes;
+        const run = await fetch(`/api/heartbeat-runs/${runId}`, { credentials: "include" }).then((r) => r.json());
+        const summary = typeof run?.resultJson?.summary === "string" ? run.resultJson.summary : null;
+        if (live) setView({ text: carry.text, tools: [...carry.open.keys()], toolCount: carry.count, status: String(run?.status ?? "running"), summary });
+        if (live && !TERMINAL.has(String(run?.status))) timer = setTimeout(tick, 1500);
+      } catch {
+        if (live) timer = setTimeout(tick, 3000);
+      }
+    };
+    let timer = setTimeout(tick, 300);
+    return () => { live = false; clearTimeout(timer); };
+  }, [runId]);
+  return view;
+}
+
 // ---------- thread ----------
+
+function initials(name: string) {
+  return name.split(/\s+/).map((w) => w[0]).join("").slice(0, 2).toUpperCase();
+}
+
+function clock(iso: string) {
+  return new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
 
 function ChatThread({
   companyId,
@@ -315,57 +387,55 @@ function ChatThread({
 }) {
   const convoQuery = usePluginData<ConversationDTO>("conversation", { companyId, conversationId });
   const sendMessage = usePluginAction("send-message");
-  const stream = usePluginStream<ChatStreamEvent>(`chat:${conversationId}`, { companyId });
-
-  const [messages, setMessages] = useState<MessageDTO[]>([]);
-  const [draft, setDraft] = useState<{ text: string; tools: string[] } | null>(null);
-  const [sending, setSending] = useState(false);
-  const [stoppedNotice, setStoppedNotice] = useState(false);
+  const completeReply = usePluginAction("complete-reply");
+  const [localSending, setLocalSending] = useState(false);
+  const [optimistic, setOptimistic] = useState<MessageDTO | null>(null);
   const [input, setInput] = useState("");
-  const processedRef = useRef(0);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const convo = convoQuery.data;
+  const pending = convo?.pending ?? null;
+  const run = useRun(pending?.runId || null);
+  const sending = localSending || Boolean(pending);
+  const messages = [...(convo?.messages ?? []), ...(optimistic && !convo?.messages.some((m) => m.role === "user" && m.text === optimistic.text && m.createdAt >= optimistic.createdAt.slice(0, 16)) ? [optimistic] : [])];
 
+  // Waiting for the send to register, keep refreshing until the conversation shows the run.
   useEffect(() => {
-    if (convoQuery.data) setMessages(convoQuery.data.messages);
-  }, [convoQuery.data]);
-
-  useEffect(() => {
-    const events = stream.events;
-    for (let i = processedRef.current; i < events.length; i++) {
-      const evt = events[i];
-      if (evt.type === "delta") {
-        setDraft((d) => ({ text: evt.text, tools: d?.tools ?? [] }));
-      } else if (evt.type === "activity") {
-        setDraft((d) => ({ text: d?.text ?? "", tools: evt.tools }));
-      } else if (evt.type === "done") {
-        setMessages((m) => [...m, { id: evt.messageId, role: "assistant", text: evt.text, createdAt: new Date().toISOString(), runId: evt.runId }]);
-        setDraft(null);
-        setSending(false);
-        onSent();
-      } else if (evt.type === "error") {
-        setMessages((m) => {
-          const fallback = m[m.length - 1]?.role === "user" ? "" : "";
-          return [...m, { id: evt.messageId, role: "assistant", text: fallback, createdAt: new Date().toISOString(), runId: evt.runId, error: evt.message }];
-        });
-        setDraft(null);
-        setSending(false);
-        onSent();
-      }
-    }
-    processedRef.current = events.length;
+    if (!sending || pending?.runId) return;
+    const t = setInterval(() => convoQuery.refresh(), 1500);
+    return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stream.events]);
+  }, [sending, pending?.runId]);
+
+  // When the run ends, save the reply (the worker ignores duplicates) and show it.
+  useEffect(() => {
+    if (!pending?.runId || !run || !TERMINAL.has(run.status)) return;
+    const text = run.text.trim() || run.summary || "";
+    const error = run.status === "succeeded" ? undefined : `The run ${run.status.replace("_", " ")}.`;
+    completeReply({ companyId, conversationId, runId: pending.runId, text, error }).finally(() => {
+      setLocalSending(false);
+      setOptimistic(null);
+      convoQuery.refresh();
+      onSent();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run?.status, pending?.runId]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [messages, draft]);
+    if (convo && !convo.pending && localSending && convo.messages.at(-1)?.role === "assistant") { setLocalSending(false); setOptimistic(null); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [convo]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages.length, run?.text, run?.tools.length]);
 
   function autoGrow() {
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+    el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
   }
 
   async function send() {
@@ -373,21 +443,14 @@ function ChatThread({
     if (!text || sending) return;
     setInput("");
     requestAnimationFrame(autoGrow);
-    setSending(true);
-    setStoppedNotice(false);
-    setMessages((m) => [...m, { id: `local-${Date.now()}`, role: "user", text, createdAt: new Date().toISOString() }]);
+    setLocalSending(true);
+    setOptimistic({ id: `local-${Date.now()}`, role: "user", text, createdAt: new Date().toISOString() });
     try {
       await sendMessage({ companyId, conversationId, prompt: text });
     } catch {
-      setSending(false);
+      setLocalSending(false);
     }
-  }
-
-  function stop() {
-    stream.close();
-    setSending(false);
-    setDraft(null);
-    setStoppedNotice(true);
+    convoQuery.refresh();
   }
 
   function onKeyDown(e: RKeyboardEvent<HTMLTextAreaElement>) {
@@ -399,85 +462,86 @@ function ChatThread({
 
   return (
     <div className="pcc-thread">
-      <header className="pcc-thread-head">
-        <span className="pcc-agent">{agentName}</span>
-      </header>
-      <div className="pcc-scroll">
-        {messages.map((m) => (
-          <MessageBubble key={m.id} message={m} companyPrefix={companyPrefix} agentId={agentId} />
-        ))}
-        {draft && (
-          <div className="pcc-msg assistant">
-            {draft.text ? (
-              <div className="pcc-bubble">
-                <MarkdownBlock content={draft.text} />
-              </div>
-            ) : null}
-            {draft.tools.length > 0 && (
-              <div className="pcc-activity">
-                <span className="pcc-dot" />
-                Working: {draft.tools.join(", ")}
-              </div>
-            )}
-            {!draft.text && draft.tools.length === 0 && (
-              <div className="pcc-activity">
-                <span className="pcc-dot" />
-                Thinking…
-              </div>
-            )}
-          </div>
-        )}
-        <div ref={bottomRef} />
-      </div>
-      <div className="pcc-composer">
-        {stoppedNotice && <p className="pcc-notice">Stopped streaming here. The agent may still finish the run in the background.</p>}
-        <textarea
-          ref={textareaRef}
-          value={input}
-          onChange={(e) => {
-            setInput(e.target.value);
-            autoGrow();
-          }}
-          onKeyDown={onKeyDown}
-          placeholder={`Message ${agentName}… (Shift+Enter for a new line)`}
-          disabled={sending}
-          rows={1}
-        />
-        <div className="pcc-composer-row">
-          <span className="muted">Each message starts a real agent run. The agent can act on what you ask, and runs have a cost.</span>
-          {sending ? (
-            <button className="pcc-btn" onClick={stop}>
-              Stop
-            </button>
-          ) : (
-            <button className="pcc-btn primary" onClick={send} disabled={!input.trim()}>
-              Send
-            </button>
+      <div ref={scrollRef} className="pcc-scroll">
+        <div className="pcc-column">
+          {messages.length === 0 && !sending && (
+            <div className="pcc-intro">
+              <span className="pcc-avatar lg">{initials(agentName)}</span>
+              <h3>Chat with {agentName}</h3>
+              <p>Ask a question, share an idea or hand over work. {agentName} can check the company's tasks and act on what you ask.</p>
+            </div>
           )}
+          {messages.map((m) => (
+            <MessageBubble key={m.id} message={m} agentName={agentName} companyPrefix={companyPrefix} agentId={agentId} />
+          ))}
+          {sending && (
+            <div className="pcc-msg assistant">
+              <div className="pcc-who"><span className="pcc-avatar">{initials(agentName)}</span><b>{agentName}</b></div>
+              {run?.text ? <div className="pcc-body"><MarkdownBlock content={run.text} /></div> : null}
+              <div className="pcc-activity">
+                <span className="pcc-dot" />
+                {run?.tools.length ? `Working: ${run.tools.join(", ")}` : run?.text ? "Writing…" : "Thinking…"}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="pcc-dock">
+        <div className="pcc-composer">
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={(e) => { setInput(e.target.value); autoGrow(); }}
+            onKeyDown={onKeyDown}
+            placeholder={`Message ${agentName}. Describe what you want done…`}
+            disabled={sending}
+            rows={2}
+          />
+          <div className="pcc-composer-row">
+            <span className="pcc-note">Each message is a real agent run and can act on what you ask.</span>
+            <span className="pcc-chip"><Icon d={I.bot} sm />{agentName}</span>
+            <button className="pcc-send" onClick={send} disabled={!input.trim() || sending} aria-label="Send" title="Send (Enter)">
+              <Icon d={I.up} />
+            </button>
+          </div>
         </div>
       </div>
     </div>
   );
 }
 
-// ---------- message bubble ----------
+// ---------- messages ----------
 
-function MessageBubble({ message, companyPrefix, agentId }: { message: MessageDTO; companyPrefix: string | null; agentId: string }) {
+function MessageBubble({ message, agentName, companyPrefix, agentId }: { message: MessageDTO; agentName: string; companyPrefix: string | null; agentId: string }) {
   const nav = useHostNavigation();
-  const isUser = message.role === "user";
-  return (
-    <div className={`pcc-msg ${isUser ? "user" : "assistant"}`}>
-      <div className={`pcc-bubble${message.error ? " error" : ""}`}>
-        {isUser ? message.text : <MarkdownBlock content={message.text || (message.error ? "" : "…")} />}
-        {message.error && <p style={{ margin: "6px 0 0", color: "inherit" }}>Run failed: {message.error}</p>}
+  const [copied, setCopied] = useState(false);
+  if (message.role === "user") {
+    return (
+      <div className="pcc-msg user">
+        <div className="pcc-bubble">{message.text}</div>
+        <span className="pcc-time">{clock(message.createdAt)}</span>
       </div>
-      {!isUser && message.runId && (
-        <div className="pcc-msg-meta">
-          <a className="pcc-run-link" {...nav.linkProps(`/${companyPrefix}/agents/${agentId}`)}>
-            Run {message.runId.slice(0, 8)}
-          </a>
-        </div>
-      )}
+    );
+  }
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(message.text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* clipboard blocked */ }
+  };
+  return (
+    <div className="pcc-msg assistant">
+      <div className="pcc-who"><span className="pcc-avatar">{initials(agentName)}</span><b>{agentName}</b></div>
+      {message.text ? <div className="pcc-body"><MarkdownBlock content={message.text} /></div> : null}
+      {message.error && <p className="pcc-error">{message.error}</p>}
+      <div className="pcc-meta">
+        <span>{clock(message.createdAt)}</span>
+        {message.runId && companyPrefix && (
+          <>
+            <span>·</span>
+            <a href={nav.resolveHref(`/${companyPrefix}/agents/${agentId}`)} onClick={(e) => { e.preventDefault(); nav.navigate(`/${companyPrefix}/agents/${agentId}`); }}>View run</a>
+          </>
+        )}
+        <span className="pcc-grow" />
+        {message.text && <button className="pcc-icon-btn" onClick={copy} aria-label="Copy reply" title="Copy">{copied ? <Icon d={I.check} sm /> : <Icon d={I.copy} sm />}</button>}
+      </div>
     </div>
   );
 }

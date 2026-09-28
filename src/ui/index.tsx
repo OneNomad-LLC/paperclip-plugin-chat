@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as RKeyboardEvent } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent as RKeyboardEvent } from "react";
 import { useHostContext, useHostLocation, useHostNavigation, usePluginAction, usePluginData, MarkdownBlock } from "@paperclipai/plugin-sdk/ui";
 import type { PluginPageProps, PluginSidebarProps } from "@paperclipai/plugin-sdk/ui";
 import { CSS } from "./styles";
@@ -20,11 +20,13 @@ type ChatStreamEvent =
 
 function useStyles() {
   useEffect(() => {
-    if (document.getElementById("pcc-styles")) return;
-    const el = document.createElement("style");
-    el.id = "pcc-styles";
-    el.textContent = CSS;
-    document.head.appendChild(el);
+    let el = document.getElementById("pcc-styles");
+    if (!el) {
+      el = document.createElement("style");
+      el.id = "pcc-styles";
+      document.head.appendChild(el);
+    }
+    if (el.textContent !== CSS) el.textContent = CSS;
   }, []);
 }
 
@@ -48,8 +50,30 @@ const I = {
   check: '<path d="M20 6 9 17l-5-5"/>',
   up: '<path d="M12 19V5M5 12l7-7 7 7"/>',
   bot: '<rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4M8 14h.01M16 14h.01"/>',
+  run: '<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
   copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
 };
+
+// The same character Paperclip draws for agents, colored by the host's theme variables.
+function AgentAvatar({ size = 28, name }: { size?: number; name?: string }) {
+  const gradient = `pcc-pill-${useId().replace(/:/g, "")}`;
+  return (
+    <span className="pcc-avatar" style={{ width: size, height: size }} role="img" aria-label={name ? `${name} avatar` : "Agent avatar"}>
+      <svg viewBox="0 0 100 93" fill="none" aria-hidden="true">
+        <path d="M54.7022 14.3438C29.7981 14.3438 9.60938 34.5085 9.60938 59.3831V87.5272C9.60938 90.385 11.9261 92.7018 14.784 92.7018H94.6204C97.4782 92.7018 99.795 90.385 99.795 87.5272V59.3831C99.795 34.5085 79.6063 14.3438 54.7022 14.3438Z" fill={`url(#${gradient})`} />
+        <rect x="76.1406" y="63.1328" width="8.87072" height="10.3492" rx="4.43536" fill="var(--pill-guy-eye, #060606)" />
+        <rect x="28.8301" y="63.1328" width="8.87072" height="10.3492" rx="4.43536" fill="var(--pill-guy-eye, #060606)" />
+        <path d="M22.5464 10.6842C15.1541 21.0252 20.3287 39.5225 0 45.762C17.2549 61.9384 64.3127 49.1324 74.6619 21.781C79.4668 33.6086 90.5552 41.0009 96.469 42.8447C112.362 5.51809 69.8569 -5.24463 62.8342 3.25648C48.7889 -3.39656 29.7044 0.670936 22.5464 10.6842Z" fill="var(--pill-guy-tuft, #2d200d)" />
+        <defs>
+          <linearGradient id={gradient} x1="54.7022" y1="14.3437" x2="54.7022" y2="107.486" gradientUnits="userSpaceOnUse">
+            <stop stopColor="var(--pill-guy-alive-top, #3028aa)" />
+            <stop offset="1" stopColor="var(--pill-guy-alive-bottom, #e5484d)" />
+          </linearGradient>
+        </defs>
+      </svg>
+    </span>
+  );
+}
 
 function useActiveConversation() {
   const loc = useHostLocation();
@@ -179,13 +203,12 @@ export function ChatPage({ context }: PluginPageProps) {
             conversationId={active.id}
             agentId={active.agentId}
             agentName={active.agentName}
+            agentTitle={agents.find((a) => a.id === active.agentId)?.title ?? null}
             onSent={() => conversationsQuery.refresh()}
           />
         ) : (
           <div className="pcc-center-empty" style={{ margin: "auto" }}>
-            <div className="ico">
-              <Icon d={I.chat} />
-            </div>
+            <AgentAvatar size={64} />
             <h3>Talk to an agent</h3>
             <p>Start a conversation without opening a task. Each message wakes the agent for a real run.</p>
             <button className="pcc-btn primary" onClick={() => setPickerOpen(true)}>
@@ -290,9 +313,10 @@ function ConversationRow({
   return (
     <div className={`pcc-row${active ? " on" : ""}`}>
       <button className="pcc-row-main" onClick={onSelect}>
-        <span className="pcc-row-title">{convo.title}</span>
-        <span className="pcc-row-meta">
-          {convo.agentName} · {since(convo.lastMessageAt ?? convo.updatedAt)}
+        <AgentAvatar size={26} name={convo.agentName} />
+        <span className="pcc-row-text">
+          <span className="pcc-row-top"><span className="pcc-row-title">{convo.title}</span><span className="pcc-row-time">{since(convo.lastMessageAt ?? convo.updatedAt)}</span></span>
+          <span className="pcc-row-meta">{convo.agentName}{convo.lastMessagePreview && convo.lastMessagePreview !== convo.title ? `: ${convo.lastMessagePreview}` : ""}</span>
         </span>
       </button>
       <div className="pcc-row-actions">
@@ -376,6 +400,7 @@ function ChatThread({
   conversationId,
   agentId,
   agentName,
+  agentTitle,
   onSent,
 }: {
   companyId: string;
@@ -383,6 +408,7 @@ function ChatThread({
   conversationId: string;
   agentId: string;
   agentName: string;
+  agentTitle?: string | null;
   onSent: () => void;
 }) {
   const convoQuery = usePluginData<ConversationDTO>("conversation", { companyId, conversationId });
@@ -460,15 +486,27 @@ function ChatThread({
     }
   }
 
+  const suggestions = ["How is the project going?", "What's blocked, and who needs to act?", "What should I review next?"];
+
   return (
     <div className="pcc-thread">
+      <header className="pcc-head">
+        <AgentAvatar size={32} name={agentName} />
+        <div className="pcc-head-text">
+          <b>{agentName}</b>
+          <span>{agentTitle && agentTitle !== agentName ? agentTitle : "Agent"}</span>
+        </div>
+      </header>
       <div ref={scrollRef} className="pcc-scroll">
         <div className="pcc-column">
           {messages.length === 0 && !sending && (
             <div className="pcc-intro">
-              <span className="pcc-avatar lg">{initials(agentName)}</span>
+              <AgentAvatar size={64} name={agentName} />
               <h3>Chat with {agentName}</h3>
-              <p>Ask a question, share an idea or hand over work. {agentName} can check the company's tasks and act on what you ask.</p>
+              <p>Ask a question, share an idea or hand over work. {agentName} can look at the company's tasks and act on what you ask.</p>
+              <div className="pcc-suggest">
+                {suggestions.map((q) => <button key={q} onClick={() => { setInput(q); requestAnimationFrame(() => textareaRef.current?.focus()); }}>{q}</button>)}
+              </div>
             </div>
           )}
           {messages.map((m) => (
@@ -476,11 +514,14 @@ function ChatThread({
           ))}
           {sending && (
             <div className="pcc-msg assistant">
-              <div className="pcc-who"><span className="pcc-avatar">{initials(agentName)}</span><b>{agentName}</b></div>
-              {run?.text ? <div className="pcc-body"><MarkdownBlock content={run.text} /></div> : null}
-              <div className="pcc-activity">
-                <span className="pcc-dot" />
-                {run?.tools.length ? `Working: ${run.tools.join(", ")}` : run?.text ? "Writing…" : "Thinking…"}
+              <AgentAvatar name={agentName} />
+              <div className="pcc-content">
+                <div className="pcc-who"><b>{agentName}</b></div>
+                {run?.text ? <div className="pcc-body"><MarkdownBlock content={run.text} /></div> : null}
+                <div className="pcc-activity">
+                  <span className="pcc-typing"><i /><i /><i /></span>
+                  {run?.tools.length ? `Working: ${run.tools.join(", ")}` : run?.text ? "Writing" : "Thinking"}
+                </div>
               </div>
             </div>
           )}
@@ -493,17 +534,17 @@ function ChatThread({
             value={input}
             onChange={(e) => { setInput(e.target.value); autoGrow(); }}
             onKeyDown={onKeyDown}
-            placeholder={`Message ${agentName}. Describe what you want done…`}
+            placeholder={`Message ${agentName}…`}
             disabled={sending}
-            rows={2}
+            rows={1}
           />
-          <div className="pcc-composer-row">
-            <span className="pcc-note">Each message is a real agent run and can act on what you ask.</span>
-            <span className="pcc-chip"><Icon d={I.bot} sm />{agentName}</span>
-            <button className="pcc-send" onClick={send} disabled={!input.trim() || sending} aria-label="Send" title="Send (Enter)">
-              <Icon d={I.up} />
-            </button>
-          </div>
+          <button className="pcc-send" onClick={send} disabled={!input.trim() || sending} aria-label="Send" title="Send (Enter)">
+            <Icon d={I.up} />
+          </button>
+        </div>
+        <div className="pcc-hint">
+          <span><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</span>
+          <span>Each message is a real agent run</span>
         </div>
       </div>
     </div>
@@ -526,21 +567,24 @@ function MessageBubble({ message, agentName, companyPrefix, agentId }: { message
   const copy = async () => {
     try { await navigator.clipboard.writeText(message.text); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch { /* clipboard blocked */ }
   };
+  const runHref = companyPrefix ? `/${companyPrefix}/agents/${agentId}` : null;
   return (
     <div className="pcc-msg assistant">
-      <div className="pcc-who"><span className="pcc-avatar">{initials(agentName)}</span><b>{agentName}</b></div>
-      {message.text ? <div className="pcc-body"><MarkdownBlock content={message.text} /></div> : null}
-      {message.error && <p className="pcc-error">{message.error}</p>}
-      <div className="pcc-meta">
-        <span>{clock(message.createdAt)}</span>
-        {message.runId && companyPrefix && (
-          <>
-            <span>·</span>
-            <a href={nav.resolveHref(`/${companyPrefix}/agents/${agentId}`)} onClick={(e) => { e.preventDefault(); nav.navigate(`/${companyPrefix}/agents/${agentId}`); }}>View run</a>
-          </>
-        )}
-        <span className="pcc-grow" />
-        {message.text && <button className="pcc-icon-btn" onClick={copy} aria-label="Copy reply" title="Copy">{copied ? <Icon d={I.check} sm /> : <Icon d={I.copy} sm />}</button>}
+      <AgentAvatar name={agentName} />
+      <div className="pcc-content">
+        <div className="pcc-who">
+          <b>{agentName}</b>
+          <span className="pcc-time">{clock(message.createdAt)}</span>
+          <span className="pcc-grow" />
+          <span className="pcc-tools">
+            {message.text && <button className="pcc-icon-btn" onClick={copy} aria-label="Copy reply" title="Copy">{copied ? <Icon d={I.check} sm /> : <Icon d={I.copy} sm />}</button>}
+            {message.runId && runHref && (
+              <a className="pcc-icon-btn" href={nav.resolveHref(runHref)} onClick={(e) => { e.preventDefault(); nav.navigate(runHref); }} aria-label="View run" title="View run"><Icon d={I.run} sm /></a>
+            )}
+          </span>
+        </div>
+        {message.text ? <div className="pcc-body"><MarkdownBlock content={message.text} /></div> : null}
+        {message.error && <p className="pcc-error">{message.error}</p>}
       </div>
     </div>
   );

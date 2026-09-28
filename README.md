@@ -31,6 +31,10 @@ do, ask the agent before you send something that commits it to work.
 
 **How replies show up.** The page follows the agent's run through Paperclip's own run API with your session, so text and tool activity appear as the agent works. The reply is saved to the conversation when the run ends. Leaving the page doesn't stop the run: open the conversation again and the finished reply is there.
 
+## How the agent remembers the conversation
+
+Paperclip doesn't resume an agent's session between chat runs, so every message you send includes the whole conversation so far. The agent always sees the entire chat. Very long chats drop their oldest messages from what's sent (the full history stays saved), and the agent is told when that happens.
+
 ## Where history lives
 
 Conversations and messages are stored in this plugin's own state, scoped per company. They aren't

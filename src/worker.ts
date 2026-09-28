@@ -51,6 +51,37 @@ function indexKey(companyId: string) {
 function conversationKey(companyId: string, id: string) {
   return { scopeKind: "company" as const, scopeId: companyId, namespace: NAMESPACE, stateKey: `conversation:${id}` };
 }
+// Paperclip doesn't resume chat sessions between runs, so every message carries the whole conversation.
+const HISTORY_LIMIT = 120_000;
+
+function promptWithHistory(convo: Conversation, newMessage: string): string {
+  const earlier = convo.messages.slice(0, -1).filter((m) => m.text.trim());
+  const lines = earlier.map((m) => {
+    const who = m.role === "user" ? "Board" : `You (${convo.agentName})`;
+    return `[${who}, ${m.createdAt.slice(0, 16).replace("T", " ")} UTC]\n${m.text.trim()}`;
+  });
+  let transcript = lines.join("\n\n");
+  let trimmed = false;
+  while (transcript.length > HISTORY_LIMIT && lines.length > 1) {
+    lines.shift();
+    trimmed = true;
+    transcript = lines.join("\n\n");
+  }
+  const intro = "This is a direct chat with the board (the person who runs this company) in Paperclip's Chat page. It isn't attached to a task.";
+  if (!lines.length) return `${intro}\n\nMessage from the board:\n${newMessage}`;
+  return [
+    intro,
+    `The conversation so far, oldest first${trimmed ? " (the earliest messages were left out to save space)" : ""}:`,
+    "<conversation>",
+    transcript,
+    "</conversation>",
+    "New message from the board:",
+    newMessage,
+    "",
+    "Reply to the new message, using the whole conversation above as context.",
+  ].join("\n\n");
+}
+
 function titleFromPrompt(prompt: string): string {
   const flat = prompt.trim().replace(/\s+/g, " ");
   return flat.length > TITLE_MAX ? `${flat.slice(0, TITLE_MAX - 1)}…` : flat || "New chat";
@@ -215,6 +246,7 @@ const plugin = definePlugin({
       if (isFirstMessage) convo.title = titleFromPrompt(prompt);
       convo.updatedAt = now;
       await saveConversation(companyId, convo);
+      const agentPrompt = promptWithHistory(convo, prompt);
       await upsertIndexEntry(companyId, {
         id: convo.id,
         title: convo.title,
@@ -338,13 +370,13 @@ const plugin = definePlugin({
       try {
         let sessionId = await ensureSession();
         try {
-          const result = await ctx.agents.sessions.sendMessage(sessionId, companyId, { prompt, reason: "Chat plugin message", onEvent });
+          const result = await ctx.agents.sessions.sendMessage(sessionId, companyId, { prompt: agentPrompt, reason: "Chat plugin message", onEvent });
           await recordRun(result.runId);
           return { runId: result.runId, conversationId, assistantMessageId };
         } catch {
           activeConvo.sessionId = null;
           sessionId = await ensureSession();
-          const result = await ctx.agents.sessions.sendMessage(sessionId, companyId, { prompt, reason: "Chat plugin message", onEvent });
+          const result = await ctx.agents.sessions.sendMessage(sessionId, companyId, { prompt: agentPrompt, reason: "Chat plugin message", onEvent });
           await recordRun(result.runId);
           return { runId: result.runId, conversationId, assistantMessageId };
         }
